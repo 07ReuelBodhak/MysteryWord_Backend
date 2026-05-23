@@ -31,6 +31,7 @@ mongo_client = AsyncIOMotorClient(
 )
 
 db = mongo_client["mystery-word"]
+leaderboard_col = db["leaderboards"]
 
 # =========================================================
 # REDIS
@@ -207,53 +208,95 @@ async def save_session(
     )
 
 # =========================================================
-# SESSION TIMER
+# LEADERBOARD UPDATE
 # =========================================================
 
+async def update_leaderboard(
+    discord_id: str,
+    username: str,
+    difficulty: str,
+    result: str,  # "win" or "loss"
+):
+
+    points_map = {
+        "easy": {"win": 10, "loss": -20},
+        "medium": {"win": 15, "loss": -10},
+        "hard": {"win": 30, "loss": -5},
+    }
+
+    points = points_map[difficulty][result]
+
+    await leaderboard_col.update_one(
+        {"discord_id": discord_id},
+
+        {
+            # update static info (safe overwrite)
+            "$set": {
+                "username": username,
+            },
+
+            # ONLY increments (no conflict possible)
+            "$inc": {
+                "total_points": points,
+                "wins": 1 if result == "win" else 0,
+                "losses": 1 if result == "loss" else 0,
+                "games_played": 1,
+            },
+        }
+    )
+
+# =========================================================
+# SESSION TIMER
+# =========================================================
 async def session_timer(session_id: str):
 
     try:
-
-
         while True:
 
-            raw_session = await redis_client.get(
-                f"session:{session_id}"
-            )
+            raw_session = await redis_client.get(f"session:{session_id}")
 
             if not raw_session:
-
                 return
 
-            session = json.loads(
-                raw_session
-            )
+            session = json.loads(raw_session)
+            print("session : ",session)
 
-            remaining = (
-                session["expires_at"]
-                - time.time()
-            )
-
-            if (
-                session["status"]
-                != "active"
-            ):
-
+            # If session already ended somewhere else, stop timer
+            if session["status"] != "active":
                 return
+
+            remaining = session["expires_at"] - time.time()
 
             if remaining <= 0:
-
                 break
 
             await asyncio.sleep(1)
 
-        session["status"] = "expired"
+        # ===================== TIMEOUT OCCURRED =====================
 
-        await save_session(
-            session_id,
-            session,
+        # IMPORTANT: re-fetch to avoid race condition
+        raw_session = await redis_client.get(f"session:{session_id}")
+
+        if not raw_session:
+            return
+
+        session = json.loads(raw_session)
+
+        if session["status"] != "active":
+            return
+
+        session["status"] = "expired"
+        await save_session(session_id, session)
+
+        # ===================== LEADERBOARD LOSS UPDATE =====================
+        await update_leaderboard(
+            session["player_id"],
+            session["player_username"],
+            session["difficulty"],
+            "loss",
         )
 
+        # ===================== BROADCAST GAME OVER =====================
         await manager.broadcast(
             session_id,
             {
@@ -263,18 +306,16 @@ async def session_timer(session_id: str):
             },
         )
 
+        # give frontend time to show UI
         await asyncio.sleep(5)
 
-        await redis_client.delete(
-            f"session:{session_id}"
-        )
+        # ===================== CLEANUP =====================
+        await redis_client.delete(f"session:{session_id}")
+
+        print(f"SESSION EXPIRED -> {session_id}")
 
     except Exception as e:
-
-        print(
-            "SESSION TIMER ERROR:",
-            e,
-        )
+        print("SESSION TIMER ERROR:", e)
 
 # =========================================================
 # ROOT
@@ -394,6 +435,9 @@ async def get_active_games():
             raw_session
         )
 
+        if session["status"] != "active":
+            continue
+
         session_id = key.split(":")[1]
 
         games.append({
@@ -487,215 +531,92 @@ async def get_game_session(
 # WEBSOCKET
 # =========================================================
 
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    session_id: str,
-):
 
-    await manager.connect(
-        session_id,
-        websocket,
-    )
+@app.websocket("/ws/{session_id}")
+async def ws(websocket: WebSocket, session_id: str):
+
+    await manager.connect(session_id, websocket)
 
     try:
-
         while True:
+            data = json.loads(await websocket.receive_text())
 
-            raw_data = (
-                await websocket.receive_text()
-            )
+            session = await get_session(session_id)
 
-            data = json.loads(
-                raw_data
-            )
+            # ===================== ASK QUESTION =====================
+            if data["type"] == "ask_question":
 
-            message_type = data.get(
-                "type"
-            )
+                answer = random.choice(["Yes", "No", "Maybe"])
 
-            session = await get_session(
-                session_id
-            )
-
-            # =====================================
-            # ASK QUESTION
-            # =====================================
-
-            if (
-                message_type
-                == "ask_question"
-            ):
-
-                question = data.get(
-                    "question"
-                )
-
-                ai_answer = random.choice([
-                    "Yes",
-                    "No",
-                    "Maybe",
-                ])
-
-                question_data = {
-
-                    "question":
-                        question,
-
-                    "answer":
-                        ai_answer,
+                q = {
+                    "question": data["question"],
+                    "answer": answer,
                 }
 
-                session["questions"].append(
-                    question_data
-                )
+                session["questions"].append(q)
+                await save_session(session_id, session)
 
-                await save_session(
-                    session_id,
-                    session,
-                )
+                await manager.broadcast(session_id, {
+                    "type": "question_answered",
+                    "data": q,
+                })
 
-                await manager.broadcast(
-                    session_id,
-                    {
-                        "type":
-                            "question_answered",
+            # ===================== FINAL GUESS =====================
+            elif data["type"] == "final_guess":
 
-                        "data":
-                            question_data,
-                    },
-                )
+                guess = data["guess"]
+                correct = session["word"]
 
-            # =====================================
-            # FINAL GUESS
-            # =====================================
-
-            elif (
-                message_type
-                == "final_guess"
-            ):
-
-                guess = data.get(
-                    "guess"
-                )
-
-                correct_word = (
-                    session["word"]
-                )
-
-                is_correct = (
-
-                    guess.lower().strip()
-
-                    ==
-
-                    correct_word.lower().strip()
-                )
+                is_correct = guess.strip().lower() == correct.strip().lower()
 
                 if is_correct:
 
-                    session["status"] = (
-                        "finished"
+                    session["status"] = "finished"
+                    await save_session(session_id, session)
+
+                    # ✅ WIN LEADERBOARD UPDATE
+                    await update_leaderboard(
+                        session["player_id"],
+                        session["player_username"],
+                        session["difficulty"],
+                        "win",
                     )
 
-                    await save_session(
-                        session_id,
-                        session,
-                    )
-
-                    await manager.broadcast(
-                        session_id,
-                        {
-                            "type":
-                                "game_over",
-
-                            "result":
-                                "win",
-
-                            "word":
-                                correct_word,
-                        },
-                    )
+                    await manager.broadcast(session_id, {
+                        "type": "game_over",
+                        "result": "win",
+                        "word": correct,
+                    })
 
                     await asyncio.sleep(5)
-
-                    await redis_client.delete(
-                        f"session:{session_id}"
-                    )
+                    await redis_client.delete(f"session:{session_id}")
 
                 else:
 
-                    await manager.broadcast(
-                        session_id,
-                        {
-                            "type":
-                                "wrong_guess",
+                    await manager.broadcast(session_id, {
+                        "type": "wrong_guess",
+                        "guess": guess,
+                    })
 
-                            "guess":
-                                guess,
-                        },
-                    )
+            # ===================== CHAT =====================
+            elif data["type"] == "chat_message":
 
-            # =====================================
-            # CHAT MESSAGE
-            # =====================================
-
-            elif (
-                message_type
-                == "chat_message"
-            ):
-
-                username = data.get(
-                    "username"
-                )
-
-                message = data.get(
-                    "message"
-                )
-
-                message_data = {
-
-                    "sender":
-                        username,
-
-                    "message":
-                        message,
+                msg = {
+                    "sender": data["username"],
+                    "message": data["message"],
                 }
 
-                session[
-                    "chat_messages"
-                ].append(
-                    message_data
-                )
+                session["chat_messages"].append(msg)
+                await save_session(session_id, session)
 
-                await save_session(
-                    session_id,
-                    session,
-                )
-
-                await manager.broadcast(
-                    session_id,
-                    {
-                        "type":
-                            "spectator_message",
-
-                        "data":
-                            message_data,
-                    },
-                )
+                await manager.broadcast(session_id, {
+                    "type": "spectator_message",
+                    "data": msg,
+                })
 
     except WebSocketDisconnect:
-
-        manager.disconnect(
-            session_id,
-            websocket,
-        )
+        manager.disconnect(session_id, websocket)
 
     except Exception as e:
-
         print("WS ERROR:", e)
-
-        manager.disconnect(
-            session_id,
-            websocket,
-        )
+        manager.disconnect(session_id, websocket)
