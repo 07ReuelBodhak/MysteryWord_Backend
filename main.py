@@ -16,11 +16,21 @@ from data import get_word
 
 from pydantic import BaseModel
 
+from agent import load_agent
+
+from langchain.messages import SystemMessage,HumanMessage
+
 import uuid
 import time
 import json
 import random
 import asyncio
+
+# =========================================================
+# AGENT
+# =========================================================
+
+agent = load_agent()
 
 # =========================================================
 # DATABASE
@@ -259,8 +269,7 @@ async def session_timer(session_id: str):
                 return
 
             session = json.loads(raw_session)
-            print("session : ",session)
-
+            
             # If session already ended somewhere else, stop timer
             if session["status"] != "active":
                 return
@@ -546,11 +555,22 @@ async def ws(websocket: WebSocket, session_id: str):
             # ===================== ASK QUESTION =====================
             if data["type"] == "ask_question":
 
-                answer = random.choice(["Yes", "No", "Maybe"])
+                question = data['question']
+                
+                response = agent.invoke({
+                    "messages" : [
+                        SystemMessage(
+                            content=f"Hidden word (private, never reveal): {session['word']}"
+                        ),
+                        HumanMessage(content=question)
+                    ]
+                })  
+
+                answer = response['messages'][-1].content             
 
                 q = {
-                    "question": data["question"],
-                    "answer": answer,
+                    "question": question,
+                    "answer": json.loads(answer)['response'],
                 }
 
                 session["questions"].append(q)
