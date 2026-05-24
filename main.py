@@ -42,6 +42,7 @@ mongo_client = AsyncIOMotorClient(
 
 db = mongo_client["mystery-word"]
 leaderboard_col = db["leaderboards"]
+recent_games = db['recentgames']
 
 # =========================================================
 # REDIS
@@ -256,6 +257,62 @@ async def update_leaderboard(
     )
 
 # =========================================================
+# ADD RECENT GAMES
+# =========================================================
+
+# =========================================================
+# ADD RECENT GAME
+# =========================================================
+
+async def add_recent_game(
+    discord_id: str,
+    username: str,
+    difficulty: str,
+    result: str,
+    word: str,
+):
+
+    game_data = {
+        "discord_id": discord_id,
+        "username": username,
+        "difficulty": difficulty,
+        "result": result,
+        "word": word,
+        "played_at": time.time(),
+    }
+
+    # add new recent game
+    await recent_games.insert_one(game_data)
+
+    # get all games for user sorted newest -> oldest
+    games = await recent_games.find(
+        {
+            "discord_id": discord_id
+        }
+    ).sort(
+        "played_at",
+        -1
+    ).to_list(length=None)
+
+    # keep only latest 5
+    if len(games) > 5:
+
+        old_games = games[5:]
+
+        old_ids = [
+            game["_id"]
+            for game in old_games
+        ]
+
+        await recent_games.delete_many(
+            {
+                "_id": {
+                    "$in": old_ids
+                }
+            }
+        )
+
+# =========================================================
 # SESSION TIMER
 # =========================================================
 async def session_timer(session_id: str):
@@ -303,6 +360,15 @@ async def session_timer(session_id: str):
             session["player_username"],
             session["difficulty"],
             "loss",
+        )
+
+        # ===================== RECENT GAMES (LOSE) =====================
+        await add_recent_game(
+            session["player_id"],
+            session["player_username"],
+            session["difficulty"],
+            "loss",
+            session["word"],
         )
 
         # ===================== BROADCAST GAME OVER =====================
@@ -594,12 +660,19 @@ async def ws(websocket: WebSocket, session_id: str):
                     session["status"] = "finished"
                     await save_session(session_id, session)
 
-                    # ✅ WIN LEADERBOARD UPDATE
                     await update_leaderboard(
                         session["player_id"],
                         session["player_username"],
                         session["difficulty"],
                         "win",
+                    )
+
+                    await add_recent_game(
+                        session["player_id"],
+                        session["player_username"],
+                        session["difficulty"],
+                        "win",
+                        session["word"],
                     )
 
                     await manager.broadcast(session_id, {
