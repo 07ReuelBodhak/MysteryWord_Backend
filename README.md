@@ -299,6 +299,3 @@ Each entry includes:
 
 ---
 
-# Author
-
-Built by Reuel
